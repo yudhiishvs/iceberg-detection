@@ -5,7 +5,7 @@ This module defines the base Order class and its variants:
 - LimitOrder: Buy/sell at a specific price or better
 - MarketOrder: Buy/sell at best available price
 - CancelOrder: Remove a previously placed order
-- IcebergOrder: Large order with hidden quantity
+- NaiveIcebergOrder: Large order with hidden quantity
 """
 
 from dataclasses import dataclass, field
@@ -192,7 +192,7 @@ class CancelOrder(Order):
 
 
 @dataclass
-class IcebergOrder(LimitOrder):
+class NaiveIcebergOrder(LimitOrder):
     """
     Iceberg order: large order with hidden quantity.
     
@@ -282,7 +282,7 @@ class IcebergOrder(LimitOrder):
             return False
         
         # Update quantity (this is what's visible in the book)
-        self.quantity = refill_amount
+        self.quantity = self.filled_quantity + refill_amount
         self.status = OrderStatus.ACTIVE
         self._refill_count += 1
         
@@ -295,11 +295,11 @@ class IcebergOrder(LimitOrder):
     
     def __repr__(self):
         return (
-            f"IcebergOrder(id={self.order_id}, side={self.side.value}, "
+            f"NaiveIcebergOrder(id={self.order_id}, side={self.side.value}, "
             f"price={self.price}, visible={self.quantity}/{self.visible_quantity}, "
             f"peak={self.peak_quantity}, filled={self.filled_quantity}, "
             f"hidden_remaining={self.hidden_remaining}, refills={self.refill_count})"
         )
 
 
-AnyOrder = Order | LimitOrder | MarketOrder | CancelOrder | IcebergOrder
+AnyOrder = Order | LimitOrder | MarketOrder | CancelOrder | NaiveIcebergOrder

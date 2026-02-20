@@ -14,7 +14,7 @@ from core import (
     create_default_simulator,
     LimitOrder,
     MarketOrder,
-    IcebergOrder,
+    NaiveIcebergOrder,
     OrderSide,
     OrderStatus,
 )
@@ -98,7 +98,7 @@ def example_iceberg_order():
     print("\n--- Submitting ICEBERG sell order ---")
     print("Peak: 10,000 shares | Visible tip: 100 shares | Price: $100.00")
     
-    iceberg = IcebergOrder(
+    iceberg = NaiveIcebergOrder(
         order_id="ICE001",
         timestamp=0,
         trader_id="whale1",

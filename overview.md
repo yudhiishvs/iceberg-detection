@@ -11,7 +11,7 @@ A complete, production-ready **in-process event-driven limit order book simulato
    - LimitOrder with price-time priority
    - MarketOrder for immediate execution
    - CancelOrder for removing orders
-   - IcebergOrder with auto-refill logic (THE KEY COMPONENT!)
+   - NaiveIcebergOrder with auto-refill logic (THE KEY COMPONENT!)
 
 2. **`order_book.py`** (364 lines)
    - PriceLevel with FIFO queues
@@ -50,7 +50,7 @@ A complete, production-ready **in-process event-driven limit order book simulato
 
 ```python
 # Create iceberg: 10,000 shares total, 100 visible at a time
-iceberg = IcebergOrder(
+iceberg = NaiveIcebergOrder(
     order_id="ICE001",
     side=OrderSide.SELL,
     price=100.00,

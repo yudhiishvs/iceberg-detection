@@ -10,7 +10,7 @@ from typing import List, Optional, Tuple
 from enum import Enum
 
 from core.order import (
-    Order, LimitOrder, MarketOrder, CancelOrder, IcebergOrder,
+    Order, LimitOrder, MarketOrder, CancelOrder, NaiveIcebergOrder,
     OrderSide, OrderStatus, OrderType
 )
 from core.order_book import OrderBook
@@ -62,7 +62,7 @@ class MatchingEngine:
         """
         self.order_book = order_book
         self._trade_id_counter = 0
-        self._pending_icebergs: dict[str, IcebergOrder] = {}  # Track icebergs needing refill
+        self._pending_icebergs: dict[str, NaiveIcebergOrder] = {}  # Track icebergs needing refill
     
     def _generate_trade_id(self) -> str:
         """Generate a unique trade ID"""
@@ -76,7 +76,7 @@ class MatchingEngine:
             return self._process_cancel(order, timestamp)
         elif isinstance(order, MarketOrder):
             return self._process_market_order(order, timestamp)
-        elif isinstance(order, IcebergOrder):
+        elif isinstance(order, NaiveIcebergOrder):
             return self._process_iceberg_order(order, timestamp)
         elif isinstance(order, LimitOrder):
             return self._process_limit_order(order, timestamp)
@@ -87,6 +87,94 @@ class MatchingEngine:
                 accepted=False,
                 rejection_reason=f"Unknown order type: {type(order)}"
             )
+        
+    def _match_order(self, aggressive_order: Order) -> List[Trade]:
+        """
+        Match an incoming aggressive order against the book.
+        
+        Args:
+            aggressive_order: The incoming order
+            
+        Returns:
+            List of generated trades
+        """
+        trades = []
+        
+        while aggressive_order.quantity > 0:
+            # Get best price level
+            if aggressive_order.side == OrderSide.BUY:
+                best_price = self.order_book.best_ask
+                if best_price is None:
+                    break
+                # For limit orders, check price constraint
+                if isinstance(aggressive_order, LimitOrder) or isinstance(aggressive_order, NaiveIcebergOrder):
+                    if aggressive_order.price < best_price:
+                        break
+            else:
+                best_price = self.order_book.best_bid
+                if best_price is None:
+                    break
+                # For limit orders, check price constraint
+                if isinstance(aggressive_order, LimitOrder) or isinstance(aggressive_order, NaiveIcebergOrder):
+                    if aggressive_order.price > best_price:
+                        break
+                        
+            # Get the price level object
+            level = self.order_book.get_level(best_price, 
+                                            OrderSide.SELL if aggressive_order.side == OrderSide.BUY else OrderSide.BUY)
+            
+            if not level or level.is_empty():
+                break
+                
+            # Match at this level
+            # We implement custom matching logic here to handle icebergs correctly
+            while aggressive_order.quantity > 0 and not level.is_empty():
+                resting_order = level.peek_front()
+                if not resting_order:
+                    break
+                    
+                match_qty = min(aggressive_order.quantity, resting_order.quantity)
+                
+                # Execute trade
+                trade = Trade(
+                    trade_id=f"T{self.trade_counter:08d}",
+                    timestamp=aggressive_order.timestamp,
+                    price=best_price,
+                    quantity=match_qty,
+                    buy_order_id=aggressive_order.order_id if aggressive_order.side == OrderSide.BUY else resting_order.order_id,
+                    sell_order_id=aggressive_order.order_id if aggressive_order.side == OrderSide.SELL else resting_order.order_id,
+                    aggressor_side=aggressive_order.side
+                )
+                trades.append(trade)
+                self.trade_counter += 1
+                
+                # Update quantities
+                aggressive_order.fill(match_qty)
+                resting_order.fill(match_qty)
+                level._total_quantity -= match_qty # Manually update level quantity
+                
+                # Handle filled resting order (Check for Iceberg Refill HERE)
+                if resting_order.is_filled:
+                    # If it's an iceberg, try to refill it immediately
+                    if isinstance(resting_order, NaiveIcebergOrder) and resting_order.needs_refill:
+                        if resting_order.refill():
+                            # It successfully refilled! 
+                            # We do NOT remove it from the deque. 
+                            # We allow the loop to continue and potentially match against it again.
+                            # We must add the new quantity back to the level's total
+                            level._total_quantity += resting_order.quantity
+                        else:
+                            # Refill failed (empty), remove it
+                            level.remove_order(resting_order.order_id)
+                    else:
+                        # Standard order filled, remove it
+                        level.remove_order(resting_order.order_id)
+                elif resting_order.quantity == 0:
+                     # This catches cases where quantity is 0 but is_filled might be false 
+                     # (though fill() handles status, safety check)
+                     level.remove_order(resting_order.order_id)
+
+        return trades
     
     def _process_cancel(self, cancel_order: CancelOrder, timestamp: float) -> OrderResult:
         """
@@ -160,7 +248,7 @@ class MatchingEngine:
             total_filled += matched_qty
             
             # Check if passive order was an iceberg that needs refill
-            if isinstance(passive_order, IcebergOrder) and passive_order.needs_refill:
+            if isinstance(passive_order, NaiveIcebergOrder) and passive_order.needs_refill:
                 self._pending_icebergs[passive_order.order_id] = passive_order
         
         return OrderResult(
@@ -171,80 +259,176 @@ class MatchingEngine:
             remaining_quantity=order.remaining_quantity
         )
     
+    # def _process_limit_order(self, order: LimitOrder, timestamp: float) -> OrderResult:
+    #     """
+    #     Process a limit order.
+    #     First attempts to match against existing orders. Any unfilled
+    #     quantity is added to the book.
+        
+    #     Args:
+    #         order: Limit order
+    #         timestamp: Current time
+    #     Returns:
+    #         Result with trades and book placement info
+    #     """
+    #     trades = []
+        
+    #     # Check if this order can match immediately
+    #     if order.side == OrderSide.BUY:
+    #         # Buy order: check if we can match against asks
+    #         best_ask = self.order_book.best_ask
+    #         can_match = best_ask is not None and order.price >= best_ask
+    #     else:
+    #         # Sell order: check if we can match against bids
+    #         best_bid = self.order_book.best_bid
+    #         can_match = best_bid is not None and order.price <= best_bid
+        
+    #     # Execute immediate matches
+    #     if can_match:
+    #         # Use market matching logic but respect price limit
+    #         remaining = order.remaining_quantity
+            
+    #         while remaining > 0:
+    #             matches = self.order_book.match_market_order(order.side, remaining)
+                
+    #             if not matches:
+    #                 break
+                
+    #             # Check if match price is acceptable
+    #             for passive_order, matched_qty, match_price in matches:
+    #                 # Verify price is within limit
+    #                 if order.side == OrderSide.BUY and match_price > order.price:
+    #                     break
+    #                 if order.side == OrderSide.SELL and match_price < order.price:
+    #                     break
+                    
+    #                 trade = self._create_trade(
+    #                     timestamp=timestamp,
+    #                     price=match_price,
+    #                     quantity=matched_qty,
+    #                     aggressor_order=order,
+    #                     passive_order=passive_order
+    #                 )
+    #                 trades.append(trade)
+                    
+    #                 order.fill(matched_qty)
+    #                 remaining = order.remaining_quantity
+                    
+    #                 # Track iceberg refills
+    #                 if isinstance(passive_order, NaiveIcebergOrder) and passive_order.needs_refill:
+    #                     self._pending_icebergs[passive_order.order_id] = passive_order
+                
+    #             # Stop if we can't match at acceptable price
+    #             if order.side == OrderSide.BUY:
+    #                 best_ask = self.order_book.best_ask
+    #                 if best_ask is None or best_ask > order.price:
+    #                     break
+    #             else:
+    #                 best_bid = self.order_book.best_bid
+    #                 if best_bid is None or best_bid < order.price:
+    #                     break
+        
+    #     # Add any remaining quantity to the book
+    #     if order.remaining_quantity > 0:
+    #         order.status = OrderStatus.ACTIVE
+    #         self.order_book.add_order(order)
+        
+    #     return OrderResult(
+    #         order=order,
+    #         trades=trades,
+    #         accepted=True,
+    #         filled_quantity=order.filled_quantity,
+    #         remaining_quantity=order.remaining_quantity
+    #     )
+
     def _process_limit_order(self, order: LimitOrder, timestamp: float) -> OrderResult:
         """
-        Process a limit order.
-        First attempts to match against existing orders. Any unfilled
-        quantity is added to the book.
-        
-        Args:
-            order: Limit order
-            timestamp: Current time
-        Returns:
-            Result with trades and book placement info
+        Process a limit order with atomic iceberg support.
         """
         trades = []
         
-        # Check if this order can match immediately
-        if order.side == OrderSide.BUY:
-            # Buy order: check if we can match against asks
-            best_ask = self.order_book.best_ask
-            can_match = best_ask is not None and order.price >= best_ask
-        else:
-            # Sell order: check if we can match against bids
-            best_bid = self.order_book.best_bid
-            can_match = best_bid is not None and order.price <= best_bid
-        
-        # Execute immediate matches
-        if can_match:
-            # Use market matching logic but respect price limit
-            remaining = order.remaining_quantity
-            
-            while remaining > 0:
-                matches = self.order_book.match_market_order(order.side, remaining)
-                
-                if not matches:
+        # 1. Match continuously until filled or no more valid liquidity
+        while order.remaining_quantity > 0:
+            # Check for liquidity
+            if order.side == OrderSide.BUY:
+                best_price = self.order_book.best_ask
+                # Stop if no sellers or price is too high
+                if best_price is None or best_price > order.price:
                     break
+                passive_side = OrderSide.SELL
+            else: # SELL
+                best_price = self.order_book.best_bid
+                # Stop if no buyers or price is too low
+                if best_price is None or best_price < order.price:
+                    break
+                passive_side = OrderSide.BUY
+            
+            # Get the actual price level object
+            # Note: We need to access the internal book structure or use a helper
+            # Since get_level isn't in the provided snippets, we use get_liquidity logic
+            # or simply rely on a loop over the best price orders.
+            
+            # Let's peek at the first order at the best price
+            # We need to access the level directly to modify it
+            side_dict = self.order_book._asks if passive_side == OrderSide.SELL else self.order_book._bids
+            level = side_dict.get(best_price)
+            
+            if not level or level.is_empty():
+                # Should not happen if best_price was valid, but safety check
+                if level and level.is_empty():
+                    del side_dict[best_price]
+                continue
                 
-                # Check if match price is acceptable
-                for passive_order, matched_qty, match_price in matches:
-                    # Verify price is within limit
-                    if order.side == OrderSide.BUY and match_price > order.price:
-                        break
-                    if order.side == OrderSide.SELL and match_price < order.price:
-                        break
-                    
-                    trade = self._create_trade(
-                        timestamp=timestamp,
-                        price=match_price,
-                        quantity=matched_qty,
-                        aggressor_order=order,
-                        passive_order=passive_order
-                    )
-                    trades.append(trade)
-                    
-                    order.fill(matched_qty)
-                    remaining = order.remaining_quantity
-                    
-                    # Track iceberg refills
-                    if isinstance(passive_order, IcebergOrder) and passive_order.needs_refill:
-                        self._pending_icebergs[passive_order.order_id] = passive_order
+            passive_order = level.peek_front()
+            
+            # Calculate match quantity
+            match_qty = min(order.remaining_quantity, passive_order.quantity)
+            
+            # Execute Trade
+            trade = self._create_trade(
+                timestamp=timestamp,
+                price=best_price,
+                quantity=match_qty,
+                aggressor_order=order,
+                passive_order=passive_order
+            )
+            trades.append(trade)
+            
+            # Update Quantities
+            order.fill(match_qty)
+            passive_order.fill(match_qty)
+            level._total_quantity -= match_qty
+            
+            # Handle Passive Order Logic (Removal or Refill)
+            if passive_order.is_filled:
+                # Remove the finished tip/order from the front
+                level.orders.popleft()
+                # Don't remove from map yet if it might refill
                 
-                # Stop if we can't match at acceptable price
-                if order.side == OrderSide.BUY:
-                    best_ask = self.order_book.best_ask
-                    if best_ask is None or best_ask > order.price:
-                        break
+                if isinstance(passive_order, NaiveIcebergOrder) and passive_order.needs_refill:
+                    if passive_order.refill():
+                        # REFILL SUCCESS: Add back to end of queue (priority loss)
+                        level.orders.append(passive_order)
+                        level._total_quantity += passive_order.quantity
+                        # It stays in the order_map, so no map updates needed
+                    else:
+                        # REFILL FAILED: Totally done
+                        if passive_order.order_id in level._order_map:
+                            del level._order_map[passive_order.order_id]
                 else:
-                    best_bid = self.order_book.best_bid
-                    if best_bid is None or best_bid < order.price:
-                        break
-        
-        # Add any remaining quantity to the book
+                    # STANDARD ORDER: Totally done
+                    if passive_order.order_id in level._order_map:
+                        del level._order_map[passive_order.order_id]
+            
+            # If the level became empty after this match (and no refill happened), clean it up
+            if level.is_empty():
+                del side_dict[best_price]
+                
+        # 2. Add remaining quantity to book
         if order.remaining_quantity > 0:
             order.status = OrderStatus.ACTIVE
             self.order_book.add_order(order)
-        
+            
         return OrderResult(
             order=order,
             trades=trades,
@@ -253,7 +437,7 @@ class MatchingEngine:
             remaining_quantity=order.remaining_quantity
         )
     
-    def _process_iceberg_order(self, order: IcebergOrder, timestamp: float) -> OrderResult:
+    def _process_iceberg_order(self, order: NaiveIcebergOrder, timestamp: float) -> OrderResult:
         """
         Process an iceberg order (only visible tip is shown).
         
@@ -318,34 +502,29 @@ class MatchingEngine:
             aggressor_side=aggressor_order.side
         )
     
-    def get_pending_iceberg_refills(self) -> List[IcebergOrder]:
+    def get_pending_iceberg_refills(self) -> List[NaiveIcebergOrder]:
         return list(self._pending_icebergs.values())
     
     def refill_iceberg(self, order_id: str) -> bool:
         """
         Refill an iceberg order's visible portion.
-        
-        Args:
-            order_id: ID of iceberg order to refill
-        Returns:
-            True if refilled successfully, False otherwise
         """
+        # 1. Check if the order is actually in the pending list
         if order_id not in self._pending_icebergs:
             return False
         
         iceberg = self._pending_icebergs[order_id]
         
-        # Attempt to refill
+        # 2. Attempt to refill (updates quantity and hidden_remaining)
         success = iceberg.refill()
         
         if success:
-            # Add refilled order back to the book
+            # 3. Add refilled order back to the book (this resets its time priority)
             iceberg.status = OrderStatus.ACTIVE
             self.order_book.add_order(iceberg)
             
-            # Remove from pending list
+            # 4. Remove from pending list now that it's back in the book
             del self._pending_icebergs[order_id]
-            
             return True
         else:
             # No more hidden quantity, order is complete

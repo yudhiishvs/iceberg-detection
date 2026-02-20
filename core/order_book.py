@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Deque
 from sortedcontainers import SortedDict
 import bisect
 
-from core.order import LimitOrder, OrderSide, IcebergOrder
+from core.order import LimitOrder, OrderSide, NaiveIcebergOrder
 
 
 class PriceLevel:

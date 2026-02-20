@@ -9,7 +9,7 @@ import random
 from typing import List, Dict, Optional, Callable
 from dataclasses import dataclass, field
 
-from core.order import Order, OrderStatus, IcebergOrder
+from core.order import Order, OrderStatus, NaiveIcebergOrder
 from core.order_book import OrderBook
 from core.matching_engine import MatchingEngine, Trade, OrderResult
 from core.event_queue import EventQueue, EventType, PeriodicEvent
@@ -108,53 +108,111 @@ class MarketSimulator:
             start_time=self.config.start_time + self.config.snapshot_interval
         )
     
+    # def submit_order(self, order: Order, delay: float = 0.0):
+    #     """
+    #     Submit an order to the market.
+        
+    #     Args:
+    #         order: Order to submit
+    #         delay: Delay before processing (0 = immediate)
+    #     """
+    #     def process_order_event():
+    #         # Set timestamp
+    #         order.timestamp = self.current_time
+            
+    #         # Process the order
+    #         result = self.matching_engine.process_order(order, self.current_time)
+            
+    #         # Update statistics
+    #         self.stats.total_orders += 1
+    #         if isinstance(order, NaiveIcebergOrder):
+    #             self.stats.iceberg_orders_submitted += 1
+            
+    #         if not result.accepted:
+    #             self.stats.rejected_orders += 1
+            
+    #         # Record order
+    #         self.order_history.append(order)
+            
+    #         # Record trades
+    #         for trade in result.trades:
+    #             self.trade_history.append(trade)
+    #             self.stats.total_trades += 1
+    #             self.stats.total_volume += trade.quantity
+    #             self.stats.total_value += trade.price * trade.quantity
+            
+    #         # Trigger callbacks
+    #         for callback in self._on_order_callbacks:
+    #             callback(order, result)
+            
+    #         for trade in result.trades:
+    #             for callback in self._on_trade_callbacks:
+    #                 callback(trade)
+            
+    #         # Schedule iceberg refills
+    #         if isinstance(order, NaiveIcebergOrder) and order.needs_refill:
+    #             self._schedule_iceberg_refill(order)
+            
+    #         return result
+        
+    #     # Schedule the order processing
+    #     if delay <= 0:
+    #         self.event_queue.schedule(
+    #             timestamp=self.current_time,
+    #             event_type=EventType.ORDER_SUBMISSION,
+    #             callback=process_order_event
+    #         )
+    #     else:
+    #         self.event_queue.schedule_after(
+    #             delay=delay,
+    #             event_type=EventType.ORDER_SUBMISSION,
+    #             callback=process_order_event
+    #         )
+        
     def submit_order(self, order: Order, delay: float = 0.0):
         """
         Submit an order to the market.
-        
-        Args:
-            order: Order to submit
-            delay: Delay before processing (0 = immediate)
         """
         def process_order_event():
             # Set timestamp
             order.timestamp = self.current_time
-            
+
             # Process the order
             result = self.matching_engine.process_order(order, self.current_time)
-            
+
             # Update statistics
             self.stats.total_orders += 1
-            if isinstance(order, IcebergOrder):
+            if isinstance(order, NaiveIcebergOrder):
                 self.stats.iceberg_orders_submitted += 1
-            
+                pass
+
             if not result.accepted:
                 self.stats.rejected_orders += 1
-            
+
             # Record order
             self.order_history.append(order)
-            
+
             # Record trades
             for trade in result.trades:
                 self.trade_history.append(trade)
                 self.stats.total_trades += 1
                 self.stats.total_volume += trade.quantity
                 self.stats.total_value += trade.price * trade.quantity
-            
+
             # Trigger callbacks
             for callback in self._on_order_callbacks:
                 callback(order, result)
-            
+
             for trade in result.trades:
                 for callback in self._on_trade_callbacks:
                     callback(trade)
-            
-            # Schedule iceberg refills
-            if isinstance(order, IcebergOrder) and order.needs_refill:
-                self._schedule_iceberg_refill(order)
-            
+
+            # Refill any icebergs that were fully filled (e.g. by this market order)
+            refilled = self.matching_engine.refill_all_icebergs()
+            self.stats.iceberg_refills += refilled
+
             return result
-        
+
         # Schedule the order processing
         if delay <= 0:
             self.event_queue.schedule(
@@ -169,7 +227,7 @@ class MarketSimulator:
                 callback=process_order_event
             )
     
-    def _schedule_iceberg_refill(self, iceberg: IcebergOrder, delay: float = 0.001):
+    def _schedule_iceberg_refill(self, iceberg: NaiveIcebergOrder, delay: float = 0.001):
         """
         Schedule refill of an iceberg order.
         
